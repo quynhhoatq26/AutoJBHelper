@@ -36,13 +36,33 @@ jobs:
         env:
           THEOS: ${{ github.workspace }}/theos
         run: |
-          # Chi build .app, khong build .deb package
           make FINALPACKAGE=1
           
-          # Tim .app da build
           APP_PATH=$(find .theos -name "AutoJBHelper.app" -type d | head -1)
           echo "App path: $APP_PATH"
           ls -la "$APP_PATH"
+          
+          # Kiem tra Info.plist co trong app khong
+          if [ ! -f "$APP_PATH/Info.plist" ]; then
+            echo "Info.plist missing, copying manually..."
+            cp AutoJBHelper/Info.plist "$APP_PATH/Info.plist"
+          fi
+          
+          echo "=== After fix ==="
+          ls -la "$APP_PATH"
+
+      - name: Re-sign with entitlements
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          APP_PATH=$(find .theos -name "AutoJBHelper.app" -type d | head -1)
+          BINARY="$APP_PATH/AutoJBHelper"
+          
+          # Re-sign binary voi entitlements
+          ldid -Sentitlements.plist "$BINARY"
+          
+          # Verify
+          ldid -e "$BINARY" | head -30
 
       - name: Create IPA
         env:
@@ -50,7 +70,6 @@ jobs:
         run: |
           mkdir -p output
           
-          # Tim .app
           APP_PATH=$(find .theos -name "AutoJBHelper.app" -type d | head -1)
           
           if [ -z "$APP_PATH" ]; then
@@ -58,12 +77,14 @@ jobs:
             exit 1
           fi
           
-          # Tao IPA tu .app
+          # Tao IPA
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
           zip -r output/AutoJBHelper.ipa Payload
           rm -rf Payload
           
+          echo "=== IPA contents ==="
+          unzip -l output/AutoJBHelper.ipa
           ls -la output/
 
       - name: Upload IPA

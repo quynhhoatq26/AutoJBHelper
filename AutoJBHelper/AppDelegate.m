@@ -2,7 +2,8 @@
 #import <UIKit/UIKit.h>
 #import <BackgroundTasks/BackgroundTasks.h>
 #import <sys/stat.h>
-#import <sys/sysctl.h>
+#import <spawn.h>
+#import <sys/wait.h>
 
 @interface AppDelegate ()
 @end
@@ -10,52 +11,37 @@
 @implementation AppDelegate
 
 // ============================================================
-// Kiem tra phone co dang JB hay khong
-// Cach moi: check process launchd_1 cua Dopamine co chay khong
-// Khi JB: co process /var/jb/basebin/jbctl + launchd_1
-// Khi mat JB: khong co process nay (du /var/jb/ folder van ton tai)
+// Kiem tra phone co dang JB hay khong bang posix_spawn
+// Chi khi JB, posix_spawn moi co the chay binary trong /var/jb/
+// Khi mat JB, syscall se fail hoac binh thuong nhung khong co quyen thuc thi
 // ============================================================
 - (BOOL)isJailbroken {
-    // Cach 1: Check symlink /var/jb co mount point thuc khong
-    // /var/jb/basebin la folder cua Dopamine, chi ton tai KHI mount active
+    pid_t pid;
+    // Chay /var/jb/usr/bin/uname - binary toi gian, exit ngay
+    const char *args[] = {"/var/jb/usr/bin/uname", NULL};
+    
+    // File phai ton tai truoc
     struct stat st;
-    if (stat("/var/jb/basebin/jbctl", &st) == 0 && S_ISREG(st.st_mode)) {
-        // File la regular file va accessible
-        // Kiem tra them: file co the doc duoc khong
-        FILE *f = fopen("/var/jb/basebin/jbctl", "r");
-        if (f) {
-            // Doc 4 bytes dau (magic number cua Mach-O)
-            unsigned char magic[4];
-            size_t n = fread(magic, 1, 4, f);
-            fclose(f);
-            if (n == 4 && magic[0] == 0xcf && magic[1] == 0xfa) {
-                // Mach-O binary, phone dang JB that
-                return YES;
-            }
-        }
+    if (stat("/var/jb/usr/bin/uname", &st) != 0) {
+        return NO;  // File khong ton tai = mat JB chac chan
     }
     
-    // Cach 2: Check qua system call fork() - JB cho phep fork, mat JB thi fail
-    // Can chu y: fork trong iOS app sandbox luon fail, khong dung
+    // Thu spawn binary
+    int result = posix_spawn(&pid, "/var/jb/usr/bin/uname", NULL, NULL, 
+                             (char * const *)args, NULL);
     
-    // Cach 3: Check co process mobile_obliterator / launchd_1 khong
-    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-    size_t size = 0;
-    if (sysctl(mib, 3, NULL, &size, NULL, 0) == 0) {
-        struct kinfo_proc *procs = malloc(size);
-        if (sysctl(mib, 3, procs, &size, NULL, 0) == 0) {
-            int count = size / sizeof(struct kinfo_proc);
-            for (int i = 0; i < count; i++) {
-                const char *name = procs[i].kp_proc.p_comm;
-                if (strcmp(name, "launchd_1") == 0 || 
-                    strcmp(name, "jbctl") == 0 ||
-                    strcmp(name, "dopamined") == 0) {
-                    free(procs);
-                    return YES;
-                }
-            }
-        }
-        free(procs);
+    if (result != 0) {
+        // posix_spawn fail = khong chay duoc = mat JB
+        return NO;
+    }
+    
+    // Cho process exit
+    int status;
+    waitpid(pid, &status, 0);
+    
+    // Neu exit code = 0, process chay thanh cong = JB con hoat dong
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return YES;
     }
     
     return NO;
@@ -102,11 +88,6 @@
     
     NSError *error = nil;
     [[BGTaskScheduler sharedScheduler] submitTaskRequest:request error:&error];
-    if (error) {
-        NSLog(@"[AutoJBHelper] Loi dang ky background task: %@", error);
-    } else {
-        NSLog(@"[AutoJBHelper] Da dang ky background task");
-    }
 }
 
 - (void)handleBackgroundTask:(BGAppRefreshTask *)task {
@@ -150,65 +131,56 @@
     statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [vc.view addSubview:statusLabel];
     
-    // Debug: hien thi chi tiet
+    // Debug info
     UILabel *debugLabel = [[UILabel alloc] init];
     NSMutableString *debug = [NSMutableString string];
     
-    // Check /var/jb/basebin/jbctl
-    struct stat st;
-    int statResult = stat("/var/jb/basebin/jbctl", &st);
-    [debug appendFormat:@"stat jbctl: %d\n", statResult];
+    // Test multiple binaries
+    const char *binaries[] = {
+        "/var/jb/usr/bin/uname",
+        "/var/jb/bin/sh",
+        "/var/jb/usr/bin/sh",
+        "/var/jb/basebin/jbctl",
+    };
     
-    if (statResult == 0) {
-        FILE *f = fopen("/var/jb/basebin/jbctl", "r");
-        if (f) {
-            unsigned char magic[4];
-            size_t n = fread(magic, 1, 4, f);
-            fclose(f);
-            [debug appendFormat:@"magic: %02x %02x %02x %02x (%zu bytes)\n", magic[0], magic[1], magic[2], magic[3], n];
-        } else {
-            [debug appendString:@"fopen FAIL\n"];
-        }
-    }
-    
-    // Count processes matching JB
-    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-    size_t size = 0;
-    int jbProcCount = 0;
-    if (sysctl(mib, 3, NULL, &size, NULL, 0) == 0) {
-        struct kinfo_proc *procs = malloc(size);
-        if (sysctl(mib, 3, procs, &size, NULL, 0) == 0) {
-            int count = size / sizeof(struct kinfo_proc);
-            for (int i = 0; i < count; i++) {
-                const char *name = procs[i].kp_proc.p_comm;
-                if (strcmp(name, "launchd_1") == 0 || 
-                    strcmp(name, "jbctl") == 0 ||
-                    strcmp(name, "dopamined") == 0) {
-                    jbProcCount++;
-                }
+    for (int i = 0; i < 4; i++) {
+        struct stat st;
+        int statResult = stat(binaries[i], &st);
+        [debug appendFormat:@"stat %s: %d\n", binaries[i], statResult];
+        
+        if (statResult == 0) {
+            pid_t pid;
+            const char *args[] = {binaries[i], NULL};
+            int spawn_result = posix_spawn(&pid, binaries[i], NULL, NULL, 
+                                           (char * const *)args, NULL);
+            [debug appendFormat:@" spawn: %d", spawn_result];
+            if (spawn_result == 0) {
+                int status;
+                waitpid(pid, &status, 0);
+                [debug appendFormat:@" exit: %d\n", WEXITSTATUS(status)];
+            } else {
+                [debug appendString:@"\n"];
             }
         }
-        free(procs);
     }
-    [debug appendFormat:@"JB procs: %d\n", jbProcCount];
     
     debugLabel.text = debug;
     debugLabel.textColor = [UIColor whiteColor];
-    debugLabel.textAlignment = NSTextAlignmentCenter;
-    debugLabel.font = [UIFont systemFontOfSize:12];
+    debugLabel.textAlignment = NSTextAlignmentLeft;
+    debugLabel.font = [UIFont fontWithName:@"Menlo" size:10];
     debugLabel.numberOfLines = 0;
     debugLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [vc.view addSubview:debugLabel];
     
     [NSLayoutConstraint activateConstraints:@[
         [label.centerXAnchor constraintEqualToAnchor:vc.view.centerXAnchor],
-        [label.centerYAnchor constraintEqualToAnchor:vc.view.centerYAnchor constant:-60],
+        [label.centerYAnchor constraintEqualToAnchor:vc.view.centerYAnchor constant:-100],
         [statusLabel.centerXAnchor constraintEqualToAnchor:vc.view.centerXAnchor],
         [statusLabel.topAnchor constraintEqualToAnchor:label.bottomAnchor constant:20],
         [debugLabel.centerXAnchor constraintEqualToAnchor:vc.view.centerXAnchor],
         [debugLabel.topAnchor constraintEqualToAnchor:statusLabel.bottomAnchor constant:30],
-        [debugLabel.leadingAnchor constraintEqualToAnchor:vc.view.leadingAnchor constant:20],
-        [debugLabel.trailingAnchor constraintEqualToAnchor:vc.view.trailingAnchor constant:-20],
+        [debugLabel.leadingAnchor constraintEqualToAnchor:vc.view.leadingAnchor constant:10],
+        [debugLabel.trailingAnchor constraintEqualToAnchor:vc.view.trailingAnchor constant:-10],
     ]];
     
     self.window.rootViewController = vc;
@@ -218,7 +190,6 @@
 }
 
 - (void)applicationDidBecomeActive:(UIApplication *)application {
-    NSLog(@"[AutoJBHelper] App became active");
     [self checkAndOpenDopamine];
 }
 

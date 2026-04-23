@@ -1,6 +1,8 @@
 #import "AppDelegate.h"
 #import <UIKit/UIKit.h>
 #import <BackgroundTasks/BackgroundTasks.h>
+#import <sys/stat.h>
+#import <sys/sysctl.h>
 
 @interface AppDelegate ()
 @end
@@ -9,19 +11,51 @@
 
 // ============================================================
 // Kiem tra phone co dang JB hay khong
+// Cach moi: check process launchd_1 cua Dopamine co chay khong
+// Khi JB: co process /var/jb/basebin/jbctl + launchd_1
+// Khi mat JB: khong co process nay (du /var/jb/ folder van ton tai)
 // ============================================================
 - (BOOL)isJailbroken {
-    NSFileManager *fm = [NSFileManager defaultManager];
+    // Cach 1: Check symlink /var/jb co mount point thuc khong
+    // /var/jb/basebin la folder cua Dopamine, chi ton tai KHI mount active
+    struct stat st;
+    if (stat("/var/jb/basebin/jbctl", &st) == 0 && S_ISREG(st.st_mode)) {
+        // File la regular file va accessible
+        // Kiem tra them: file co the doc duoc khong
+        FILE *f = fopen("/var/jb/basebin/jbctl", "r");
+        if (f) {
+            // Doc 4 bytes dau (magic number cua Mach-O)
+            unsigned char magic[4];
+            size_t n = fread(magic, 1, 4, f);
+            fclose(f);
+            if (n == 4 && magic[0] == 0xcf && magic[1] == 0xfa) {
+                // Mach-O binary, phone dang JB that
+                return YES;
+            }
+        }
+    }
     
-    if ([fm fileExistsAtPath:@"/var/jb/usr/bin/sh"]) return YES;
-    if ([fm fileExistsAtPath:@"/var/jb/usr/bin/launchctl"]) return YES;
-    if ([fm fileExistsAtPath:@"/var/jb/basebin"]) return YES;
-    if ([fm fileExistsAtPath:@"/var/jb/Library/LaunchDaemons"]) return YES;
+    // Cach 2: Check qua system call fork() - JB cho phep fork, mat JB thi fail
+    // Can chu y: fork trong iOS app sandbox luon fail, khong dung
     
-    FILE *f = fopen("/var/jb/usr/bin/sh", "r");
-    if (f) {
-        fclose(f);
-        return YES;
+    // Cach 3: Check co process mobile_obliterator / launchd_1 khong
+    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t size = 0;
+    if (sysctl(mib, 3, NULL, &size, NULL, 0) == 0) {
+        struct kinfo_proc *procs = malloc(size);
+        if (sysctl(mib, 3, procs, &size, NULL, 0) == 0) {
+            int count = size / sizeof(struct kinfo_proc);
+            for (int i = 0; i < count; i++) {
+                const char *name = procs[i].kp_proc.p_comm;
+                if (strcmp(name, "launchd_1") == 0 || 
+                    strcmp(name, "jbctl") == 0 ||
+                    strcmp(name, "dopamined") == 0) {
+                    free(procs);
+                    return YES;
+                }
+            }
+        }
+        free(procs);
     }
     
     return NO;
@@ -107,19 +141,74 @@
     label.translatesAutoresizingMaskIntoConstraints = NO;
     [vc.view addSubview:label];
     
+    BOOL jb = [self isJailbroken];
     UILabel *statusLabel = [[UILabel alloc] init];
-    statusLabel.text = [self isJailbroken] ? @"Dang JB" : @"Khong JB";
-    statusLabel.textColor = [self isJailbroken] ? [UIColor greenColor] : [UIColor redColor];
+    statusLabel.text = jb ? @"Dang JB" : @"Khong JB";
+    statusLabel.textColor = jb ? [UIColor greenColor] : [UIColor redColor];
     statusLabel.textAlignment = NSTextAlignmentCenter;
     statusLabel.font = [UIFont systemFontOfSize:18];
     statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [vc.view addSubview:statusLabel];
     
+    // Debug: hien thi chi tiet
+    UILabel *debugLabel = [[UILabel alloc] init];
+    NSMutableString *debug = [NSMutableString string];
+    
+    // Check /var/jb/basebin/jbctl
+    struct stat st;
+    int statResult = stat("/var/jb/basebin/jbctl", &st);
+    [debug appendFormat:@"stat jbctl: %d\n", statResult];
+    
+    if (statResult == 0) {
+        FILE *f = fopen("/var/jb/basebin/jbctl", "r");
+        if (f) {
+            unsigned char magic[4];
+            size_t n = fread(magic, 1, 4, f);
+            fclose(f);
+            [debug appendFormat:@"magic: %02x %02x %02x %02x (%zu bytes)\n", magic[0], magic[1], magic[2], magic[3], n];
+        } else {
+            [debug appendString:@"fopen FAIL\n"];
+        }
+    }
+    
+    // Count processes matching JB
+    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t size = 0;
+    int jbProcCount = 0;
+    if (sysctl(mib, 3, NULL, &size, NULL, 0) == 0) {
+        struct kinfo_proc *procs = malloc(size);
+        if (sysctl(mib, 3, procs, &size, NULL, 0) == 0) {
+            int count = size / sizeof(struct kinfo_proc);
+            for (int i = 0; i < count; i++) {
+                const char *name = procs[i].kp_proc.p_comm;
+                if (strcmp(name, "launchd_1") == 0 || 
+                    strcmp(name, "jbctl") == 0 ||
+                    strcmp(name, "dopamined") == 0) {
+                    jbProcCount++;
+                }
+            }
+        }
+        free(procs);
+    }
+    [debug appendFormat:@"JB procs: %d\n", jbProcCount];
+    
+    debugLabel.text = debug;
+    debugLabel.textColor = [UIColor whiteColor];
+    debugLabel.textAlignment = NSTextAlignmentCenter;
+    debugLabel.font = [UIFont systemFontOfSize:12];
+    debugLabel.numberOfLines = 0;
+    debugLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [vc.view addSubview:debugLabel];
+    
     [NSLayoutConstraint activateConstraints:@[
         [label.centerXAnchor constraintEqualToAnchor:vc.view.centerXAnchor],
-        [label.centerYAnchor constraintEqualToAnchor:vc.view.centerYAnchor constant:-30],
+        [label.centerYAnchor constraintEqualToAnchor:vc.view.centerYAnchor constant:-60],
         [statusLabel.centerXAnchor constraintEqualToAnchor:vc.view.centerXAnchor],
         [statusLabel.topAnchor constraintEqualToAnchor:label.bottomAnchor constant:20],
+        [debugLabel.centerXAnchor constraintEqualToAnchor:vc.view.centerXAnchor],
+        [debugLabel.topAnchor constraintEqualToAnchor:statusLabel.bottomAnchor constant:30],
+        [debugLabel.leadingAnchor constraintEqualToAnchor:vc.view.leadingAnchor constant:20],
+        [debugLabel.trailingAnchor constraintEqualToAnchor:vc.view.trailingAnchor constant:-20],
     ]];
     
     self.window.rootViewController = vc;

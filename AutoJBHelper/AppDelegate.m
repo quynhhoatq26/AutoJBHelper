@@ -7,9 +7,7 @@
 #import <sys/wait.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-
-// Private API declarations
-extern NSString* SBSCopyFrontmostApplicationDisplayIdentifier(void);
+#import <dlfcn.h>
 
 @interface AppDelegate ()
 @property (strong, nonatomic) AVAudioPlayer *silentPlayer;
@@ -59,18 +57,22 @@ extern NSString* SBSCopyFrontmostApplicationDisplayIdentifier(void);
 // Lay app dang foreground (qua private API SpringBoardServices)
 // Tra ve bundle ID hoac nil
 // ============================================================
+typedef NSString* (*SBSCopyFrontmostFunc)(void);
+
 - (NSString *)frontmostAppBundleID {
-    // Cach 1: Dung SBSCopyFrontmostApplicationDisplayIdentifier (private)
-    void *handle = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
-    if (handle) {
-        NSString* (*SBSCopyFrontmost)(void) = dlsym(handle, "SBSCopyFrontmostApplicationDisplayIdentifier");
-        if (SBSCopyFrontmost) {
-            NSString *bundle = SBSCopyFrontmost();
-            if (bundle) {
-                NSString *result = [bundle copy];
-                // Note: don't dlclose - keep handle alive
-                return result;
-            }
+    static SBSCopyFrontmostFunc SBSCopyFrontmost = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        void *handle = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+        if (handle) {
+            SBSCopyFrontmost = (SBSCopyFrontmostFunc)dlsym(handle, "SBSCopyFrontmostApplicationDisplayIdentifier");
+        }
+    });
+    
+    if (SBSCopyFrontmost) {
+        NSString *bundle = SBSCopyFrontmost();
+        if (bundle) {
+            return [bundle copy];
         }
     }
     
@@ -93,24 +95,20 @@ extern NSString* SBSCopyFrontmostApplicationDisplayIdentifier(void);
 
 // ============================================================
 // Check: target app co dang foreground HOAC foreground trong 5 phut qua khong
-// Tra ve YES neu co -> KHONG mo Dopamine
-// Tra ve NO neu khong -> co the mo Dopamine
 // ============================================================
 - (BOOL)targetAppActiveRecently {
     NSString *front = [self frontmostAppBundleID];
     
-    // Neu 1 target app dang foreground -> active
     if (front && [[self targetApps] containsObject:front]) {
         return YES;
     }
     
-    // Check lich su foreground trong 5 phut qua
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     for (NSString *bundle in [self targetApps]) {
         NSNumber *lastTime = self.lastForegroundTimes[bundle];
         if (lastTime) {
             NSTimeInterval age = now - [lastTime doubleValue];
-            if (age < 300) {  // 5 phut = 300 giay
+            if (age < 300) {
                 return YES;
             }
         }
@@ -144,57 +142,49 @@ extern NSString* SBSCopyFrontmostApplicationDisplayIdentifier(void);
 }
 
 // ============================================================
-// Main check logic - goi moi 30 giay
+// Main check - goi moi 30 giay
 // ============================================================
 - (void)periodicCheck {
-    // Cap nhat thoi gian foreground cua target apps
     [self updateForegroundTimes];
     
-    // Check JB status
     BOOL jb = [self isJailbroken];
     
     if (jb) {
-        // Dang JB -> khong lam gi
         NSLog(@"[AutoJBHelper] Dang JB, skip");
         return;
     }
     
-    // Mat JB -> check target app co active gan day khong
     BOOL targetActive = [self targetAppActiveRecently];
     
     if (targetActive) {
-        // Target app dang hoat dong -> AutoTouch co the dang chay -> khong mo Dopamine
         NSLog(@"[AutoJBHelper] Mat JB NHUNG target app con active -> cho");
         return;
     }
     
-    // Mat JB + target app khong active > 5 phut -> mo Dopamine
     NSLog(@"[AutoJBHelper] Mat JB + target app khong active > 5 phut -> mo Dopamine");
     [self openDopamine];
 }
 
 // ============================================================
-// Silent audio trick - giu app alive trong background
+// Silent audio trick
 // ============================================================
 - (void)startSilentAudio {
     NSError *error = nil;
     
-    // Cau hinh audio session de choi background
     AVAudioSession *session = [AVAudioSession sharedInstance];
     [session setCategory:AVAudioSessionCategoryPlayback
              withOptions:AVAudioSessionCategoryOptionMixWithOthers
                    error:&error];
     [session setActive:YES error:&error];
     
-    // Tao silent audio file (programmatically generate)
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"silent.wav"];
     [self generateSilentWav:path];
     
     NSURL *url = [NSURL fileURLWithPath:path];
     self.silentPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:url error:&error];
     if (self.silentPlayer) {
-        self.silentPlayer.numberOfLoops = -1;  // Loop forever
-        self.silentPlayer.volume = 0.0;  // Silent
+        self.silentPlayer.numberOfLoops = -1;
+        self.silentPlayer.volume = 0.0;
         [self.silentPlayer play];
         NSLog(@"[AutoJBHelper] Silent audio started");
     } else {
@@ -202,25 +192,21 @@ extern NSString* SBSCopyFrontmostApplicationDisplayIdentifier(void);
     }
 }
 
-// Tao 1 file WAV im lang don gian
 - (void)generateSilentWav:(NSString *)path {
-    // WAV header + 1 second of silence (44.1kHz mono 16-bit)
     uint32_t sampleRate = 44100;
-    uint32_t numSamples = sampleRate; // 1 second
-    uint32_t dataSize = numSamples * 2; // 16-bit = 2 bytes
+    uint32_t numSamples = sampleRate;
+    uint32_t dataSize = numSamples * 2;
     uint32_t fileSize = 36 + dataSize;
     
     NSMutableData *data = [NSMutableData data];
     
-    // RIFF header
     [data appendBytes:"RIFF" length:4];
     [data appendBytes:&fileSize length:4];
     [data appendBytes:"WAVE" length:4];
     
-    // fmt chunk
     [data appendBytes:"fmt " length:4];
     uint32_t fmtSize = 16;
-    uint16_t audioFormat = 1; // PCM
+    uint16_t audioFormat = 1;
     uint16_t numChannels = 1;
     uint32_t byteRate = sampleRate * 2;
     uint16_t blockAlign = 2;
@@ -233,11 +219,9 @@ extern NSString* SBSCopyFrontmostApplicationDisplayIdentifier(void);
     [data appendBytes:&blockAlign length:2];
     [data appendBytes:&bitsPerSample length:2];
     
-    // data chunk
     [data appendBytes:"data" length:4];
     [data appendBytes:&dataSize length:4];
     
-    // Silence data (all zeros)
     char silence[1024] = {0};
     for (uint32_t i = 0; i < dataSize; i += 1024) {
         uint32_t chunk = MIN(1024, dataSize - i);
@@ -248,7 +232,7 @@ extern NSString* SBSCopyFrontmostApplicationDisplayIdentifier(void);
 }
 
 // ============================================================
-// Tra ve app truoc do (khong ve home)
+// Tra ve app truoc do
 // ============================================================
 - (void)returnToPreviousApp {
     UIApplication *app = [UIApplication sharedApplication];
@@ -294,10 +278,8 @@ extern NSString* SBSCopyFrontmostApplicationDisplayIdentifier(void);
     [self registerBackgroundTask];
     [self scheduleBackgroundTask];
     
-    // Start silent audio de giu app alive
     [self startSilentAudio];
     
-    // Setup UI
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     UIViewController *vc = [[UIViewController alloc] init];
     vc.view.backgroundColor = [UIColor blackColor];
@@ -341,14 +323,12 @@ extern NSString* SBSCopyFrontmostApplicationDisplayIdentifier(void);
     self.window.rootViewController = vc;
     [self.window makeKeyAndVisible];
     
-    // Start periodic check timer
     self.checkTimer = [NSTimer scheduledTimerWithTimeInterval:30.0
                                                        target:self
                                                      selector:@selector(periodicCheck)
                                                      userInfo:nil
                                                       repeats:YES];
     
-    // Check ngay lap tuc
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [self periodicCheck];
@@ -360,17 +340,13 @@ extern NSString* SBSCopyFrontmostApplicationDisplayIdentifier(void);
 - (void)applicationDidBecomeActive:(UIApplication *)application {
     NSLog(@"[AutoJBHelper] App became active");
     
-    // Khi app duoc mo lai (vi du AutoTouch Lua goi appActivate)
-    // -> check ngay -> neu dang JB thi back ve app truoc
     BOOL jb = [self isJailbroken];
     if (jb) {
-        // Dang JB -> back ve app truoc sau 0.1s
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             [self returnToPreviousApp];
         });
     } else {
-        // Mat JB -> mo Dopamine (khong can cho target app check vi user chu dong mo)
         [self openDopamine];
     }
 }

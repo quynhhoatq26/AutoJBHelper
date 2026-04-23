@@ -4,6 +4,8 @@
 #import <sys/stat.h>
 #import <spawn.h>
 #import <sys/wait.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 
 @interface AppDelegate ()
 @end
@@ -11,51 +13,65 @@
 @implementation AppDelegate
 
 // ============================================================
-// Kiem tra phone co dang JB hay khong bang posix_spawn
-// Chi khi JB, posix_spawn moi co the chay binary trong /var/jb/
-// Khi mat JB, syscall se fail hoac binh thuong nhung khong co quyen thuc thi
+// Kiem tra JB bang posix_spawn
 // ============================================================
 - (BOOL)isJailbroken {
     pid_t pid;
-    // Chay /var/jb/usr/bin/uname - binary toi gian, exit ngay
     const char *args[] = {"/var/jb/usr/bin/uname", NULL};
     
-    // File phai ton tai truoc
     struct stat st;
     if (stat("/var/jb/usr/bin/uname", &st) != 0) {
-        return NO;  // File khong ton tai = mat JB chac chan
+        return NO;
     }
     
-    // Thu spawn binary
     int result = posix_spawn(&pid, "/var/jb/usr/bin/uname", NULL, NULL, 
                              (char * const *)args, NULL);
     
     if (result != 0) {
-        // posix_spawn fail = khong chay duoc = mat JB
         return NO;
     }
     
-    // Cho process exit
     int status;
     waitpid(pid, &status, 0);
     
-    // Neu exit code = 0, process chay thanh cong = JB con hoat dong
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        return YES;
-    }
-    
-    return NO;
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 // ============================================================
-// Mo app Dopamine qua URL scheme
+// Mo Dopamine bang LSApplicationWorkspace (private API)
 // ============================================================
 - (void)openDopamine {
     NSLog(@"[AutoJBHelper] Phone mat JB, dang mo Dopamine...");
     
+    Class LSApplicationWorkspace = objc_getClass("LSApplicationWorkspace");
+    if (!LSApplicationWorkspace) {
+        NSLog(@"[AutoJBHelper] LSApplicationWorkspace khong ton tai");
+        return;
+    }
+    
+    // Lay defaultWorkspace
+    id workspace = ((id(*)(Class, SEL))objc_msgSend)(LSApplicationWorkspace, 
+                                                     @selector(defaultWorkspace));
+    if (!workspace) {
+        NSLog(@"[AutoJBHelper] Khong lay duoc defaultWorkspace");
+        return;
+    }
+    
+    // Goi openApplicationWithBundleID:
+    SEL selector = NSSelectorFromString(@"openApplicationWithBundleID:");
+    if ([workspace respondsToSelector:selector]) {
+        BOOL success = ((BOOL(*)(id, SEL, id))objc_msgSend)(workspace, selector, 
+                                                             @"com.opa334.Dopamine");
+        NSLog(@"[AutoJBHelper] Mo Dopamine qua LSApplicationWorkspace: %@", 
+              success ? @"OK" : @"FAIL");
+        
+        if (success) return;
+    }
+    
+    // Fallback: thu URL scheme
     NSURL *url = [NSURL URLWithString:@"dopamine://"];
     [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:^(BOOL success) {
-        NSLog(@"[AutoJBHelper] Mo Dopamine: %@", success ? @"OK" : @"FAIL");
+        NSLog(@"[AutoJBHelper] Fallback URL scheme: %@", success ? @"OK" : @"FAIL");
     }];
 }
 
@@ -64,10 +80,15 @@
 // ============================================================
 - (void)checkAndOpenDopamine {
     if (![self isJailbroken]) {
-        NSLog(@"[AutoJBHelper] Khong phat hien JB");
+        NSLog(@"[AutoJBHelper] Khong phat hien JB -> mo Dopamine");
         [self openDopamine];
     } else {
-        NSLog(@"[AutoJBHelper] Phone dang JB, khong can mo Dopamine");
+        NSLog(@"[AutoJBHelper] Phone dang JB, exit app");
+        // Dang JB -> exit app sau 0.3s de AutoTouch tiep tuc
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            exit(0);
+        });
     }
 }
 
@@ -105,14 +126,12 @@
     [self registerBackgroundTask];
     [self scheduleBackgroundTask];
     
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [self checkAndOpenDopamine];
-    });
-    
+    // Setup UI (chi hien vai giay roi exit)
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     UIViewController *vc = [[UIViewController alloc] init];
     vc.view.backgroundColor = [UIColor blackColor];
+    
+    BOOL jb = [self isJailbroken];
     
     UILabel *label = [[UILabel alloc] init];
     label.text = @"AutoJB Helper";
@@ -122,75 +141,39 @@
     label.translatesAutoresizingMaskIntoConstraints = NO;
     [vc.view addSubview:label];
     
-    BOOL jb = [self isJailbroken];
     UILabel *statusLabel = [[UILabel alloc] init];
-    statusLabel.text = jb ? @"Dang JB" : @"Khong JB";
+    statusLabel.text = jb ? @"Dang JB - Exit..." : @"Khong JB - Mo Dopamine...";
     statusLabel.textColor = jb ? [UIColor greenColor] : [UIColor redColor];
     statusLabel.textAlignment = NSTextAlignmentCenter;
     statusLabel.font = [UIFont systemFontOfSize:18];
     statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [vc.view addSubview:statusLabel];
     
-    // Debug info
-    UILabel *debugLabel = [[UILabel alloc] init];
-    NSMutableString *debug = [NSMutableString string];
-    
-    // Test multiple binaries
-    const char *binaries[] = {
-        "/var/jb/usr/bin/uname",
-        "/var/jb/bin/sh",
-        "/var/jb/usr/bin/sh",
-        "/var/jb/basebin/jbctl",
-    };
-    
-    for (int i = 0; i < 4; i++) {
-        struct stat st;
-        int statResult = stat(binaries[i], &st);
-        [debug appendFormat:@"stat %s: %d\n", binaries[i], statResult];
-        
-        if (statResult == 0) {
-            pid_t pid;
-            const char *args[] = {binaries[i], NULL};
-            int spawn_result = posix_spawn(&pid, binaries[i], NULL, NULL, 
-                                           (char * const *)args, NULL);
-            [debug appendFormat:@" spawn: %d", spawn_result];
-            if (spawn_result == 0) {
-                int status;
-                waitpid(pid, &status, 0);
-                [debug appendFormat:@" exit: %d\n", WEXITSTATUS(status)];
-            } else {
-                [debug appendString:@"\n"];
-            }
-        }
-    }
-    
-    debugLabel.text = debug;
-    debugLabel.textColor = [UIColor whiteColor];
-    debugLabel.textAlignment = NSTextAlignmentLeft;
-    debugLabel.font = [UIFont fontWithName:@"Menlo" size:10];
-    debugLabel.numberOfLines = 0;
-    debugLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [vc.view addSubview:debugLabel];
-    
     [NSLayoutConstraint activateConstraints:@[
         [label.centerXAnchor constraintEqualToAnchor:vc.view.centerXAnchor],
-        [label.centerYAnchor constraintEqualToAnchor:vc.view.centerYAnchor constant:-100],
+        [label.centerYAnchor constraintEqualToAnchor:vc.view.centerYAnchor constant:-30],
         [statusLabel.centerXAnchor constraintEqualToAnchor:vc.view.centerXAnchor],
         [statusLabel.topAnchor constraintEqualToAnchor:label.bottomAnchor constant:20],
-        [debugLabel.centerXAnchor constraintEqualToAnchor:vc.view.centerXAnchor],
-        [debugLabel.topAnchor constraintEqualToAnchor:statusLabel.bottomAnchor constant:30],
-        [debugLabel.leadingAnchor constraintEqualToAnchor:vc.view.leadingAnchor constant:10],
-        [debugLabel.trailingAnchor constraintEqualToAnchor:vc.view.trailingAnchor constant:-10],
     ]];
     
     self.window.rootViewController = vc;
     [self.window makeKeyAndVisible];
     
+    // Check va xu ly sau 0.5s
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self checkAndOpenDopamine];
+    });
+    
     return YES;
 }
 
 - (void)applicationDidBecomeActive:(UIApplication *)application {
-    [self checkAndOpenDopamine];
+    NSLog(@"[AutoJBHelper] App became active");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self checkAndOpenDopamine];
+    });
 }
 
 - (void)applicationDidEnterBackground:(UIApplication *)application {

@@ -32,17 +32,30 @@ jobs:
           make clean
           make
 
-      - name: Re-sign with entitlements
+      - name: Find .app and Package IPA
         run: |
-          cd .theos/obj/arm64/AutoJBHelper.app
-          ldid -S../../../../AutoJBHelper/entitlements.plist AutoJBHelper
-
-      - name: Package IPA
-        run: |
+          # Tim thu muc .app
+          APP_PATH=$(find . -name "AutoJBHelper.app" -type d | head -1)
+          echo "Found app at: $APP_PATH"
+          
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: AutoJBHelper.app not found!"
+            find . -name "*.app" -type d
+            exit 1
+          fi
+          
+          # Re-sign voi entitlements
+          ldid -SAutoJBHelper/entitlements.plist "$APP_PATH/AutoJBHelper"
+          
+          # Tao IPA
           mkdir -p Payload
-          cp -r .theos/obj/arm64/AutoJBHelper.app Payload/
+          cp -r "$APP_PATH" Payload/
           zip -r AutoJBHelper.ipa Payload
           rm -rf Payload
+          
+          # Verify
+          echo "IPA contents:"
+          unzip -l AutoJBHelper.ipa
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4

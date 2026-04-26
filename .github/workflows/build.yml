@@ -2,94 +2,50 @@ name: Build AutoJBHelper IPA
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
-      - name: Install ldid
+      - name: Install Theos
         run: |
-          brew install ldid
-          which ldid
+          brew install ldid dpkg make
+          git clone --recursive https://github.com/theos/theos.git ~/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
-      - name: Setup Theos
-        uses: actions/checkout@v4
-        with:
-          repository: theos/theos
-          ref: master
-          path: theos
-          submodules: recursive
-
-      - name: Setup SDK
+      - name: Install iOS SDK
         run: |
-          wget https://github.com/theos/sdks/archive/master.zip -O sdks.zip
-          unzip -q sdks.zip
-          mv sdks-master/*.sdk theos/sdks/
-          rm -rf sdks-master sdks.zip
+          cd ~/theos/sdks
+          wget https://github.com/theos/sdks/archive/master.zip
+          unzip -q master.zip
+          mv sdks-master/*.sdk .
+          rm -rf sdks-master master.zip
 
       - name: Build .app
-        env:
-          THEOS: ${{ github.workspace }}/theos
         run: |
-          make FINALPACKAGE=1
-          
-          APP_PATH=$(find .theos -name "AutoJBHelper.app" -type d | head -1)
-          echo "App path: $APP_PATH"
-          ls -la "$APP_PATH"
-          
-          # Kiem tra Info.plist co trong app khong
-          if [ ! -f "$APP_PATH/Info.plist" ]; then
-            echo "Info.plist missing, copying manually..."
-            cp AutoJBHelper/Info.plist "$APP_PATH/Info.plist"
-          fi
-          
-          echo "=== After fix ==="
-          ls -la "$APP_PATH"
+          export THEOS=$HOME/theos
+          make clean
+          make
 
       - name: Re-sign with entitlements
-        env:
-          THEOS: ${{ github.workspace }}/theos
         run: |
-          APP_PATH=$(find .theos -name "AutoJBHelper.app" -type d | head -1)
-          BINARY="$APP_PATH/AutoJBHelper"
-          
-          # Re-sign binary voi entitlements
-          ldid -Sentitlements.plist "$BINARY"
-          
-          # Verify
-          ldid -e "$BINARY" | head -30
+          cd .theos/obj/arm64/AutoJBHelper.app
+          ldid -S../../../../AutoJBHelper/entitlements.plist AutoJBHelper
 
-      - name: Create IPA
-        env:
-          THEOS: ${{ github.workspace }}/theos
+      - name: Package IPA
         run: |
-          mkdir -p output
-          
-          APP_PATH=$(find .theos -name "AutoJBHelper.app" -type d | head -1)
-          
-          if [ -z "$APP_PATH" ]; then
-            echo "ERROR: Khong tim thay AutoJBHelper.app"
-            exit 1
-          fi
-          
-          # Tao IPA
           mkdir -p Payload
-          cp -R "$APP_PATH" Payload/
-          zip -r output/AutoJBHelper.ipa Payload
+          cp -r .theos/obj/arm64/AutoJBHelper.app Payload/
+          zip -r AutoJBHelper.ipa Payload
           rm -rf Payload
-          
-          echo "=== IPA contents ==="
-          unzip -l output/AutoJBHelper.ipa
-          ls -la output/
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: AutoJBHelper-IPA
-          path: output/*.ipa
-          if-no-files-found: error
+          path: AutoJBHelper.ipa

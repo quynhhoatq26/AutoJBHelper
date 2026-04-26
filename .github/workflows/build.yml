@@ -40,9 +40,16 @@ jobs:
           
           if [ -z "$APP_PATH" ]; then
             echo "ERROR: AutoJBHelper.app not found!"
-            find . -name "*.app" -type d
             exit 1
           fi
+          
+          # FIX: Copy Info.plist vao .app bundle (Theos khong tu copy)
+          echo "Copying Info.plist to app bundle..."
+          cp AutoJBHelper/Info.plist "$APP_PATH/Info.plist"
+          
+          # Verify Info.plist da co
+          echo "Contents of .app bundle:"
+          ls -la "$APP_PATH"
           
           # Re-sign voi entitlements
           ldid -SAutoJBHelper/entitlements.plist "$APP_PATH/AutoJBHelper"
@@ -53,7 +60,7 @@ jobs:
           zip -r AutoJBHelper.ipa Payload
           rm -rf Payload
           
-          # Verify
+          # Verify IPA contents
           echo "IPA contents:"
           unzip -l AutoJBHelper.ipa
 
